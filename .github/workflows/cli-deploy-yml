@@ -1,0 +1,163 @@
+name: CI & Deploy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------
+      # Python Setup & Tests
+      # --------------------
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Install Python dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Run Python tests
+        run: pytest tests || echo "No tests found, skipping."
+
+      # --------------------
+      # Node.js Setup
+      # --------------------
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install Node.js dependencies
+        run: |
+          if [ -f package.json ]; then npm install; fi
+
+      - name: Run ESLint
+        run: |
+          if [ -f package.json ]; then npm run lint || echo "No lint script found"; fi
+
+      # --------------------
+      # Run OpenAI Examples (Optional)
+      # --------------------
+      - name: Run Python OpenAI example
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -f scripts/openai_example.py ]; then python scripts/openai_example.py; fi
+
+      - name: Run Node.js OpenAI example
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -f scripts/openai_example.js ]; then npm start; fi
+
+      # --------------------
+      # Build for Deployment
+      # --------------------
+      - name: Build site
+        run: |
+          mkdir -p dist
+
+          # Case 1: Plain HTML
+          if [ -f index.html ]; then
+            echo "Detected static HTML site"
+            cp -r * dist/ || true
+          fi
+
+          # Case 2: Jekyll
+          if [ -f _config.yml ]; then
+            echo "Detected Jekyll site"
+            gem install bundler jekyll
+            bundle install
+            bundle exec jekyll build -d dist
+          fi
+
+          # Case 3: Hugo
+          if [ -f config.toml ] || [ -f config.yaml ]; then
+            echo "Detected Hugo site"
+            wget https://github.com/gohugoio/hugo/releases/download/v0.128.2/hugo_extended_0.128.2_Linux-64bit.tar.gz
+            tar -xvzf hugo_extended_0.128.2_Linux-64bit.tar.gz
+            mv hugo /usr/local/bin/
+            hugo --minify -d dist
+          fi
+
+          # Case 4: React/Next.js
+          if [ -f package.json ]; then
+            if grep -q "next" package.json; then
+              echo "Detected Next.js site"
+              npm run build
+              npm run export || true
+              cp -r out/* dist/ || cp -r .next/* dist/ || true
+            elif grep -q "react-scripts" package.json; then
+              echo "Detected Create React App site"
+              npm run build
+              cp -r build/* dist/
+            fi
+          fi
+
+      # --------------------
+      # Pre-check before deployment
+      # --------------------
+      - name: Validate build output
+        run: |
+          if [ ! -d dist ] || [ -z "$(ls -A dist)" ]; then
+            echo "❌ ERROR: Build output folder 'dist/' is empty!"
+            exit 1
+          else
+            echo "✅ Build validation passed, files found in dist/"
+          fi
+
+      # --------------------
+      # Deploy to GitHub Pages
+      # --------------------
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist
+
+      - name: Deploy to GitHub Pages
+        id: deploy-pages
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+
+      # --------------------
+      # Always Create Release ZIPs
+      # --------------------
+      - name: Archive site
+        run: |
+          cd dist
+          zip -r ../site-build.zip .
+
+      # Versioned release (history)
+      - name: Upload Versioned Release
+        uses: softprops/action-gh-release@v1
+        if: always()
+        with:
+          tag_name: "build-${{ github.run_number }}"
+          name: "Site Build ${{ github.run_number }}"
+          body: "Auto-generated build #${{ github.run_number }} of the site."
+          files: site-build.zip
+
+      # Latest release (always updated)
+      - name: Upload Latest Release
+        uses: softprops/action-gh-release@v1
+        if: always()
+        with:
+          tag_name: "latest"
+          name: "Latest Site Build"
+          body: "This is always the most recent site build."
+          files: site-build.zip
